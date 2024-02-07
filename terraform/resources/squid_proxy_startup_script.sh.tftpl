@@ -1,0 +1,106 @@
+#! /bin/bash
+
+# Squid setup
+echo "Installing dependencies.."
+apt-get update
+apt-get install -y squid-openssl iptables net-tools systemd
+
+# Generate ssl cert and cache directory..
+echo "Generating SSL certificates.."
+mkdir -p /etc/squid/certs
+
+openssl req -new -newkey rsa:2048 -sha256 -days 365 -nodes -x509 -extensions v3_ca \
+    -subj "/C=NL/ST=/L=Amsterdam/O=Xebia/CN=does-not-matter.com" \
+    -keyout /etc/squid/certs/ca-key.pem \
+    -out /etc/squid/certs/ca-cert.pem
+
+chmod 400 /etc/squid/certs/*
+chown -R proxy /etc/squid/certs
+
+/usr/lib/squid/security_file_certgen -c -s /etc/squid/ssl_db -M 4MB
+chown -R proxy /etc/squid/ssl_db 
+
+# Allow IP forward
+echo 1 > /proc/sys/net/ipv4/ip_forward
+
+
+# Reference: https://wiki.squid-cache.org/ConfigExamples/Intercept/LinuxRedirect#iptables-configuration
+echo "Configuring nat routing table.."
+
+iptables -t nat -A PREROUTING -s ${load_balancer_ip} -p tcp --dport 80 -j ACCEPT
+iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 3129
+iptables -t nat -A POSTROUTING -j MASQUERADE
+iptables -t mangle -A PREROUTING -p tcp --dport 3129 -j DROP
+
+iptables -t nat -A PREROUTING -s ${load_balancer_ip} -p tcp --dport 443 -j ACCEPT
+iptables -t nat -A PREROUTING -p tcp --dport 443 -j REDIRECT --to-port 3130
+iptables -t nat -A POSTROUTING -j MASQUERADE
+iptables -t mangle -A PREROUTING -p tcp --dport 3130 -j DROP
+
+
+# Proxy configuration..
+echo "Configuring squid proxy.."
+
+cat <<EOF >/etc/squid/allowlist.txt
+xebia.com
+.google.com
+EOF
+
+cat <<\EOF >/etc/squid/squid.conf
+cache_effective_user proxy
+
+# Squid always needs a forward-proxy port..
+http_port 3128
+
+http_port 3129 intercept
+acl http_proxy myportname 3129
+
+https_port 3130 intercept ssl-bump tls-cert=/etc/squid/certs/ca-cert.pem tls-key=/etc/squid/certs/ca-key.pem tls-default-ca=on
+acl https_proxy myportname 3130
+
+sslcrtd_program /usr/lib/squid/security_file_certgen -s /etc/squid/ssl_db -M 4MB
+
+acl http_allow dstdomain "/etc/squid/allowlist.txt"
+acl ssl_allow ssl::server_name "/etc/squid/allowlist.txt"
+
+acl step1 at_step SslBump1
+acl step2 at_step SslBump2
+acl step3 at_step SslBump3
+
+ssl_bump splice ssl_allow
+ssl_bump peek step1
+ssl_bump stare step2
+ssl_bump bump all
+
+# Filter traffic
+# Disable unsafe ports
+acl Safe_ports port 80
+acl Safe_ports port 443
+http_access deny !Safe_ports
+
+acl SSL_ports port 443
+acl CONNECT method CONNECT
+http_access deny CONNECT !SSL_ports
+
+# Disable access to invalid domains
+http_access deny http_proxy !http_allow
+http_access deny step3 https_proxy !ssl_allow 
+
+# Default deny
+cache deny all
+htcp_access deny all
+htcp_clr_access deny all
+icp_access deny all
+icap_retry deny all
+snmp_access deny all
+EOF
+
+echo "Restarting squid.."
+systemctl restart squid
+
+if [ $? -eq 0 ]; then
+    echo "Ready to roll"
+else
+    echo "Failed to launch. Aborting.."
+    exit 1
+fi
